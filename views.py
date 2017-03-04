@@ -1,16 +1,33 @@
 __author__ = 'Jeremy Chen'
 
-import sqlite3
+from flask_sqlalchemy import SQLAlchemy
 from functools import wraps
-from forms import AddTaskForm
+from forms import AddTaskForm, RegisterForm, LoginForm
 
-from flask import Flask, flash, redirect, render_template, request, session, url_for, g
+from flask import Flask, flash, redirect, render_template, request, session, url_for
+import datetime
+
+# config
 
 app = Flask(__name__)
 app.config.from_object('_config')
+db = SQLAlchemy(app)
 
-def connect_db():
-    return sqlite3.connect(app.config['DATABASE_PATH'])
+from models import Task, User
+
+
+@app.route('/register/', methods=['GET', 'POST'])
+def register():
+    error = None
+    form = RegisterForm(request.form)
+    if request.method == 'POST':
+        if form.validate_on_submit():
+            new_user = User(form.name.data, form.email.data, form.password.data)
+            db.session.add(new_user)
+            db.session.commit()
+            flash('Thanks for registrering. Please login.')
+            return redirect(url_for('login'))
+    return render_template('register.html', form=form, error=error)
 
 def login_required(test):
     @wraps(test)
@@ -25,70 +42,86 @@ def login_required(test):
 @app.route('/logout/')
 def logout():
     session.pop('logged_in', None)
+    session.pop('user_id', None)
     flash('Goodbye!')
     return redirect(url_for('login'))
 
 @app.route('/', methods=['GET', 'POST'])
 def login():
+    error = None
+    form = LoginForm(request.form)
     if request.method == 'POST':
-        if request.form['username'] != app.config['USERNAME'] or request.form['password'] != app.config['PASSWORD']:
-            error = 'Invalid Credentials. Please try again.'
-            return render_template('login.html', error=error)
+        if form.validate_on_submit():
+            user = User.query.filter_by(name=request.form['name']).first()
+            if user is not None and user.password == request.form['password']:
+                session['logged_in'] = True
+                session['user_id'] = user.id
+                flash('Welcome')
+                return redirect(url_for('tasks'))
+            else:
+                error = 'Invalid username or password'
         else:
-            session['logged_in'] = True
-            flash('Welcome!')
-            return redirect(url_for('tasks'))
-    return render_template('login.html')
+            error = 'Both fields are required.'
+    return render_template('login.html', form=form, error=error)
 
 
 @app.route('/tasks/')
 @login_required
 def tasks():
-    g.db = connect_db()
-    cursor = g.db.execute('SELECT name, due_date, priority, task_id FROM tasks WHERE status=1')
-    open_tasks = [dict(name=row[0], due_date=row[1], priority=row[2], task_id=row[3]) for row in cursor.fetchall()]
-    cursor = g.db.execute('SELECT name, due_date, priority, task_id FROM tasks WHERE status=0')
-    closed_tasks = [dict(name=row[0], due_date=row[1], priority=row[2], task_id=row[3]) for row in cursor.fetchall()]
-    g.db.close()
+    open_tasks = db.session.query(Task).filter_by(status='1').order_by(Task.due_date.asc())
+    closed_tasks = db.session.query(Task).filter_by(status='0').order_by(Task.due_date.asc())
     return render_template('tasks.html',
                           form=AddTaskForm(request.form),
                           open_tasks=open_tasks,
                           closed_tasks=closed_tasks)
 
-@app.route('/add/', methods=['POST'])
+@app.route('/add/', methods=['GET', 'POST'])
 @login_required
 def new_task():
-    g.db = connect_db()
-    name = request.form['name']
-    date = request.form['due_date']
-    priority = request.form['priority']
-    if not name or not date or not priority:
-        flash('All fields are required. Please try again.')
-        return redirect(url_for('tasks'))
-    else:
-        g.db.execute('''INSERT INTO tasks (name, due_date, priority, status) values(?, ?, ?, 1)''',
-                     [request.form['name'], request.form['due_date'], request.form['priority']])
-        g.db.commit()
-        g.db.close()
-        flash('New entry was successfully posted. Thanks')
-        return redirect(url_for('tasks'))
+    form = AddTaskForm(request.form)
+    if request.method == 'POST':
+        if form.validate_on_submit():
+            #print((form.name.data, form.due_date.data, form.priority.data, '1'))
+            new_task = Task(form.name.data, form.due_date.data, form.priority.data,
+                            datetime.datetime.utcnow(), '1', session['user_id'])
+            db.session.add(new_task)
+            db.session.commit()
+            flash('New entry was successfully posted. Thanks.')
+    return redirect(url_for('tasks'))
 
 @app.route('/complete/<int:task_id>/')
 @login_required
 def complete(task_id):
-    g.db = connect_db()
-    g.db.execute('UPDATE tasks SET status = 0 WHERE task_id=' + str(task_id))
-    g.db.commit()
-    g.db.close()
-    flash('The task as marked as complete.')
+    selected_task = db.session.query(Task).filter_by(task_id=task_id).first()
+    if selected_task.user_id == session['user_id']:
+        db.session.query(Task).filter_by(task_id=task_id).update({'status':'0'})
+        db.session.commit()
+        flash('The task is complete. Nice')
+    else:
+        flash("You can't update other people's task.")
+    return redirect(url_for('tasks'))
+
+@app.route('/reopen/<int:task_id>/')
+@login_required
+def reopen(task_id):
+    selected_task = db.session.query(Task).filter_by(task_id=task_id).first()
+    if selected_task.user_id == session['user_id']:
+        db.session.query(Task).filter_by(task_id=task_id).update({'status':'1'})
+        db.session.commit()
+        flash('The task is reopened.')
+    else:
+        flash("You can't update other people's task.")
     return redirect(url_for('tasks'))
 
 @app.route('/delete/<int:task_id>/')
 @login_required
 def delete_entry(task_id):
-    g.db = connect_db()
-    g.db.execute('DELETE FROM tasks where task_id=' + str(task_id))
-    g.db.commit()
-    g.db.close()
-    flash('The task as deleted.')
+    selected_task = db.session.query(Task).filter_by(task_id=task_id).first()
+    if selected_task.user_id == session['user_id']:
+        db.session.query(Task).filter_by(task_id=task_id).delete()
+        db.session.commit()
+        flash('The task was deleted.')
+    else:
+        flash("You can't delete other people's task.")
     return redirect(url_for('tasks'))
+
